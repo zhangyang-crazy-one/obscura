@@ -2645,6 +2645,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   UNSENT = 0; OPENED = 1; HEADERS_RECEIVED = 2; LOADING = 3; DONE = 4;
 
   constructor() {
+    super();
     this.readyState = 0;
     this.status = 0;
     this.statusText = "";
@@ -2796,7 +2797,33 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     this.readyState = 0;
   }
 
-  // addEventListener/removeEventListener/dispatchEvent inherited from XMLHttpRequestEventTarget
+  addEventListener(type, handler) {
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(handler);
+  }
+
+  removeEventListener(type, handler) {
+    if (this._listeners[type]) {
+      this._listeners[type] = this._listeners[type].filter(h => h !== handler);
+    }
+  }
+
+  // Per WHATWG DOM spec — required by zone.js which patches XHR via
+  // Object.getOwnPropertyDescriptor on XMLHttpRequestEventTarget.prototype.
+  dispatchEvent(event) {
+    if (!event || !event.type) return false;
+    const ev = (typeof event === 'object') ? event : { type: event };
+    ev.target = ev.target || this;
+    ev.currentTarget = ev.currentTarget || this;
+    const type = ev.type;
+    const handlers = (this._listeners && this._listeners[type]) || [];
+    for (const h of handlers) { try { h.call(this, ev); } catch (e) {} }
+    const prop = 'on' + type;
+    if (typeof this[prop] === 'function') {
+      try { this[prop](ev); } catch (e) {}
+    }
+    return true;
+  }
 
   _setReadyState(state) {
     this.readyState = state;
@@ -2821,6 +2848,9 @@ _markNative(XMLHttpRequest.prototype.open);
 _markNative(XMLHttpRequest.prototype.send);
 _markNative(XMLHttpRequest.prototype.abort);
 _markNative(XMLHttpRequest.prototype.setRequestHeader);
+_markNative(XMLHttpRequest.prototype.addEventListener);
+_markNative(XMLHttpRequest.prototype.removeEventListener);
+_markNative(XMLHttpRequest.prototype.dispatchEvent);
 _markNative(XMLHttpRequest.prototype.getResponseHeader);
 _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 
