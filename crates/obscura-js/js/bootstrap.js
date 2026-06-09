@@ -67,29 +67,37 @@ let __dynScriptBusy = false;
 async function __processDynScriptQueue() {
   if (__dynScriptBusy) return;
   __dynScriptBusy = true;
-  while (__dynScriptQueue.length > 0) {
-    const task = __dynScriptQueue.shift();
-    try {
-      if (task.isModule) {
-        await import(task.url);
-      } else {
-        const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
-        const parsed = JSON.parse(raw);
-        if (parsed.body) {
-          globalThis.__currentScriptNid = task.nid;
-          try { (0, eval)(parsed.body); }
-          catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
-          finally { globalThis.__currentScriptNid = task.prevNid || 0; }
+  // try/finally so the busy flag is always cleared even if a task throws
+  // outside its own guard; otherwise the queue would wedge and silently
+  // block every later dynamic script on the page.
+  try {
+    while (__dynScriptQueue.length > 0) {
+      const task = __dynScriptQueue.shift();
+      try {
+        if (task.isModule) {
+          await import(task.url);
+        } else {
+          const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
+          const parsed = JSON.parse(raw);
+          if (parsed.body) {
+            globalThis.__currentScriptNid = task.nid;
+            try { (0, eval)(parsed.body); }
+            catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
+            finally { globalThis.__currentScriptNid = task.prevNid || 0; }
+          }
         }
+        // Fire load via dispatchEvent only: it invokes the element's onload
+        // property handler and any addEventListener('load') listeners, read
+        // live off the element. Calling onload separately would double-fire it.
+        try { task.dispatchEvent(new Event('load')); } catch(e) {}
+      } catch(e) {
+        console.error('Dynamic script fetch error:', e.message);
+        try { task.dispatchEvent(new Event('error')); } catch(ex) {}
       }
-      if (typeof task.onload === 'function') try { task.onload(new Event('load')); } catch(e) {}
-      try { task.dispatchEvent(new Event('load')); } catch(e) {}
-    } catch(e) {
-      console.error('Dynamic script fetch error:', e.message);
-      if (typeof task.onerror === 'function') try { task.onerror(e); } catch(ex) {}
     }
+  } finally {
+    __dynScriptBusy = false;
   }
-  __dynScriptBusy = false;
 }
 function _fpRand(salt) {
   let h = (_fpSeed ^ (salt || 0)) | 0;
@@ -383,16 +391,29 @@ class Node {
       const src = c.getAttribute('src');
       const prevNid = globalThis.__currentScriptNid;
       if (src) {
-        // Resolve URL against <base href> first, falling back to location.href
+        // Resolve against <base href> when present, else the document URL.
+        // The base href is resolved to an absolute URL first: a bare path like
+        // <base href="/"> (the common Angular form) is not a valid URL base on
+        // its own and would otherwise throw. Both the base and the final
+        // resolution are guarded so a bad value can never escape appendChild.
         let baseHref;
         try {
           const baseEl = globalThis.document?.querySelector('base[href]');
           baseHref = baseEl ? baseEl.getAttribute('href') : null;
         } catch(e) { baseHref = null; }
-        const baseUrl = baseHref || globalThis.location?.href || 'http://localhost/';
-        const fullUrl = src.startsWith('http') || src.startsWith('data:')
-          ? src
-          : new URL(src, baseUrl).href;
+        const docUrl = globalThis.location?.href || 'http://localhost/';
+        let baseUrl;
+        try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
+        catch(e) { baseUrl = docUrl; }
+        let fullUrl;
+        try {
+          fullUrl = src.startsWith('http') || src.startsWith('data:')
+            ? src
+            : new URL(src, baseUrl).href;
+        } catch(e) {
+          console.error('Dynamic script URL resolve failed (' + src + '):', e.message);
+          fullUrl = src;
+        }
         const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
         // Enqueue — serialized via __processDynScriptQueue to prevent
         // concurrent import() calls from triggering deno_core RefCell panic.
@@ -402,8 +423,6 @@ class Node {
           nid: c._nid,
           prevNid,
           pageOrigin,
-          onload: typeof c.onload === 'function' ? c.onload : null,
-          onerror: typeof c.onerror === 'function' ? c.onerror : null,
           dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
         });
         __processDynScriptQueue();
@@ -418,8 +437,6 @@ class Node {
               nid: c._nid,
               prevNid,
               pageOrigin: "",
-              onload: null,
-              onerror: null,
               dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
             });
             __processDynScriptQueue();
